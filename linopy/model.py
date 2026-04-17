@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from tempfile import NamedTemporaryFile, gettempdir
 from typing import Any, Literal, overload
@@ -1722,7 +1722,7 @@ class Model:
 
         return "ok", "none"
 
-    def compute_infeasibilities(self) -> list[int]:
+    def compute_infeasibilities(self) -> Iterator[list[int]]:
         """
         Compute a set of infeasible constraints.
 
@@ -1745,7 +1745,7 @@ class Model:
                 if solver_model is not None and isinstance(
                     solver_model, gurobipy.Model
                 ):
-                    return self._compute_infeasibilities_gurobi(solver_model)
+                    yield from self._compute_infeasibilities_gurobi(solver_model)
             except ImportError:
                 pass
 
@@ -1757,7 +1757,7 @@ class Model:
                 if solver_model is not None and isinstance(
                     solver_model, xpress.problem
                 ):
-                    return self._compute_infeasibilities_xpress(solver_model)
+                    yield from self._compute_infeasibilities_xpress(solver_model)
             except ImportError:
                 pass
 
@@ -1783,7 +1783,7 @@ class Model:
                 f"Current solver model type: {type(solver_model).__name__}"
             )
 
-    def _compute_infeasibilities_gurobi(self, solver_model: Any) -> list[int]:
+    def _compute_infeasibilities_gurobi(self, solver_model: Any) -> Iterator[list[int]]:
         """Compute infeasibilities for Gurobi solver."""
         solver_model.computeIIS()
         f = NamedTemporaryFile(suffix=".ilp", prefix="linopy-iis-", delete=False)
@@ -1800,9 +1800,9 @@ class Model:
                 if match:
                     labels.append(int(match.group(1)))
         f.close()
-        return labels
+        yield labels
 
-    def _compute_infeasibilities_xpress(self, solver_model: Any) -> list[int]:
+    def _compute_infeasibilities_xpress(self, solver_model: Any) -> Iterator[list[int]]:
         """
         Compute infeasibilities for Xpress solver.
 
@@ -1812,17 +1812,12 @@ class Model:
         [0, 1, 2]).
         """
         # Compute all IIS
-        try:  # Try new API first
-            solver_model.IISAll()
-        except AttributeError:  # Fallback to old API
-            solver_model.iisall()
+        iisnum = 0
 
-        # Get the number of IIS found
-        num_iis = solver_model.attributes.numiis
-        if num_iis == 0:
+        iisfirst = getattr(solver_model, "IISFirst", getattr(solver_model, "iisfirst"))
+        status = iisfirst(2)  # mode could also be 0 and 2
+        if status != 0:
             return []
-
-        labels = set()
 
         clabels = self.matrices.clabels
         constraint_position_map = {}
@@ -1832,17 +1827,19 @@ class Model:
                 if constraint_label >= 0:
                     constraint_position_map[constraint_obj] = constraint_label
 
-        # Retrieve each IIS
-        for iis_num in range(1, num_iis + 1):
-            iis_constraints = self._extract_iis_constraints(solver_model, iis_num)
+        iisnum += 1
+        yield sorted(
+            constraint_position_map[c]
+            for c in self._extract_iis_constraints(solver_model, iisnum)
+        )
 
-            for constraint_obj in iis_constraints:
-                if constraint_obj in constraint_position_map:
-                    labels.add(constraint_position_map[constraint_obj])
-                # Note: Silently skip constraints not found in mapping
-                # This can happen if the model structure changed after solving
-
-        return sorted(list(labels))
+        iisnext = getattr(solver_model, "IISNext", getattr(solver_model, "iisnext"))
+        while iisnext() == 0:
+            iisnum += 1
+            yield sorted(
+                constraint_position_map[c]
+                for c in self._extract_iis_constraints(solver_model, iisnum)
+            )
 
     def _extract_iis_constraints(self, solver_model: Any, iis_num: int) -> list[Any]:
         """
@@ -1912,7 +1909,9 @@ class Model:
 
         return miisrow
 
-    def format_infeasibilities(self, display_max_terms: int | None = None) -> str:
+    def format_infeasibilities(
+        self, display_max_terms: int | None = None
+    ) -> Iterator[str]:
         """
         Return a string representation of infeasible constraints.
 
@@ -1927,13 +1926,13 @@ class Model:
 
         Returns
         -------
-        str
+        Iterator[str]
             String representation of the infeasible constraints.
         """
-        labels = self.compute_infeasibilities()
-        return self.constraints.format_labels(
-            labels, display_max_terms=display_max_terms
-        )
+        for labels in self.compute_infeasibilities():
+            yield self.constraints.format_labels(
+                labels, display_max_terms=display_max_terms
+            )
 
     def print_infeasibilities(self, display_max_terms: int | None = None) -> None:
         """
@@ -1947,7 +1946,9 @@ class Model:
             DeprecationWarning,
             stacklevel=2,
         )
-        print(self.format_infeasibilities(display_max_terms=display_max_terms))
+        for infeas in self.format_infeasibilities(display_max_terms=display_max_terms):
+            print(infeas)
+            print("######")
 
     @deprecated(
         details="Use `compute_infeasibilities`/`format_infeasibilities` instead."
